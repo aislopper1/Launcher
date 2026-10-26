@@ -27,6 +27,10 @@ compile_commands.json
 # Build dirs
 build
 /build-*
+/clean-build*
+
+# Local portable toolchain
+/portable-tools
 
 # Install dirs
 install
