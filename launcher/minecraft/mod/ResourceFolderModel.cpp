@@ -4,6 +4,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QFileInfo>
+#include <QHash>
 #include <QHeaderView>
 #include <QIcon>
 #include <QMenu>
@@ -12,6 +13,7 @@
 #include <QThreadPool>
 #include <QUrl>
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #include "Application.h"
@@ -323,6 +325,8 @@ bool ResourceFolderModel::setResourceEnabled(const QModelIndexList& indexes, Ena
 static QMutex s_update_task_mutex;
 bool ResourceFolderModel::update()
 {
+    initializeCustomOrdering();
+
     // We hold a lock here to prevent race conditions on the m_current_update_task reset.
     QMutexLocker lock(&s_update_task_mutex);
 
@@ -466,6 +470,9 @@ Qt::ItemFlags ResourceFolderModel::flags(const QModelIndex& index) const
     auto flags = defaultFlags | Qt::ItemIsDropEnabled;
     if (index.isValid()) {
         flags |= Qt::ItemIsUserCheckable;
+        if (m_customOrderingEnabled) {
+            flags |= Qt::ItemIsDragEnabled;
+        }
     }
     return flags;
 }
@@ -473,15 +480,59 @@ Qt::ItemFlags ResourceFolderModel::flags(const QModelIndex& index) const
 QStringList ResourceFolderModel::mimeTypes() const
 {
     QStringList types;
+    types << InternalMimeType;
     types << "text/uri-list";
     return types;
 }
 
-bool ResourceFolderModel::dropMimeData(const QMimeData* data,
-                                       Qt::DropAction action,
-                                       int /*row*/,
-                                       int /*column*/,
-                                       const QModelIndex& /*parent*/)
+QMimeData* ResourceFolderModel::mimeData(const QModelIndexList& indexes) const
+{
+    if (!m_customOrderingEnabled) {
+        return nullptr;
+    }
+
+    QStringList ids;
+    for (const auto& index : indexes) {
+        if (index.column() != 0 || !validateIndex(index)) {
+            continue;
+        }
+        const auto id = m_resources[index.row()]->internalId();
+        if (!ids.contains(id)) {
+            ids.append(id);
+        }
+    }
+
+    if (ids.isEmpty()) {
+        return nullptr;
+    }
+
+    auto* mimeData = new QMimeData();
+    mimeData->setData(InternalMimeType, Json::fromStringList(ids).toUtf8());
+    return mimeData;
+}
+
+bool ResourceFolderModel::canDropMimeData(const QMimeData* data,
+                                          Qt::DropAction action,
+                                          int /*row*/,
+                                          int /*column*/,
+                                          const QModelIndex& /*parent*/) const
+{
+    if (data == nullptr) {
+        return false;
+    }
+
+    if (data->hasFormat(InternalMimeType)) {
+        return m_customOrderingEnabled && (action & Qt::MoveAction);
+    }
+
+    if (data->hasUrls()) {
+        return action & supportedDropActions();
+    }
+
+    return false;
+}
+
+bool ResourceFolderModel::dropMimeData(const QMimeData* data, Qt::DropAction action, int row, int /*column*/, const QModelIndex& parent)
 {
     if (action == Qt::IgnoreAction) {
         return true;
@@ -490,6 +541,24 @@ bool ResourceFolderModel::dropMimeData(const QMimeData* data,
     // check if the action is supported
     if ((data == nullptr) || !(action & supportedDropActions())) {
         return false;
+    }
+
+    // resources reordered from within this list
+    if (data->hasFormat(InternalMimeType)) {
+        if (!m_customOrderingEnabled || action != Qt::MoveAction) {
+            return false;
+        }
+
+        auto ids = Json::toStringList(QString::fromUtf8(data->data(InternalMimeType)));
+        if (ids.isEmpty()) {
+            return false;
+        }
+
+        int destination = row;
+        if (destination < 0) {
+            destination = parent.isValid() ? parent.row() : static_cast<int>(m_resources.size());
+        }
+        return moveResourcesById(ids, destination);
     }
 
     // files dropped from outside?
@@ -507,6 +576,229 @@ bool ResourceFolderModel::dropMimeData(const QMimeData* data,
         return true;
     }
     return false;
+}
+
+QStringList ResourceFolderModel::currentOrder() const
+{
+    QStringList order;
+    order.reserve(m_resources.size());
+    for (const auto& resource : m_resources) {
+        order.append(resource->getOriginalFileName());
+    }
+    return order;
+}
+
+void ResourceFolderModel::initializeCustomOrdering()
+{
+    if (m_customOrderingInitialized) {
+        return;
+    }
+    m_customOrderingInitialized = true;
+
+    if (m_instance == nullptr) {
+        return;
+    }
+
+    auto* settings = m_instance->settings();
+    if (settings == nullptr) {
+        return;
+    }
+
+    m_customOrderingEnabled = settings->getOrRegisterSetting(customOrderSetting("CustomOrderEnabled"), false)->get().toBool();
+    m_customOrder = Json::toStringList(settings->getOrRegisterSetting(customOrderSetting("CustomOrder"), "")->get().toString());
+
+    if (m_customOrderingEnabled) {
+        applyCustomOrder();
+    }
+}
+
+void ResourceFolderModel::setCustomOrderingEnabled(bool enabled)
+{
+    initializeCustomOrdering();
+
+    if (m_customOrderingEnabled == enabled) {
+        return;
+    }
+
+    m_customOrderingEnabled = enabled;
+
+    if (m_instance != nullptr && m_instance->settings() != nullptr) {
+        m_instance->settings()->set(customOrderSetting("CustomOrderEnabled"), enabled);
+    }
+
+    if (enabled) {
+        applyCustomOrder();
+    }
+
+    emit customOrderingChanged(enabled);
+
+    if (!m_resources.isEmpty()) {
+        emit dataChanged(index(0, 0), index(static_cast<int>(m_resources.size()) - 1, columnCount(QModelIndex()) - 1));
+    }
+}
+
+void ResourceFolderModel::setCustomOrder(const QStringList& order)
+{
+    initializeCustomOrdering();
+
+    m_customOrder = order;
+    if (m_customOrderingEnabled) {
+        applyCustomOrder();
+    } else {
+        saveCustomOrder();
+    }
+}
+
+bool ResourceFolderModel::moveResourcesById(const QStringList& ids, int destinationRow)
+{
+    QList<int> rows;
+    for (const auto& id : ids) {
+        auto rowIt = m_resourcesIndex.constFind(id);
+        if (rowIt != m_resourcesIndex.constEnd() && !rows.contains(rowIt.value())) {
+            rows.append(rowIt.value());
+        }
+    }
+
+    if (rows.isEmpty()) {
+        return false;
+    }
+
+    std::sort(rows.begin(), rows.end());
+
+    const int destination = std::clamp(destinationRow, 0, static_cast<int>(m_resources.size()));
+
+    QSet<int> movingRows;
+    for (int row : rows) {
+        movingRows.insert(row);
+    }
+
+    int adjustedDestination = destination;
+    for (int row : rows) {
+        if (row < destination) {
+            --adjustedDestination;
+        }
+    }
+
+    QList<Resource::Ptr> newOrder;
+    newOrder.reserve(m_resources.size());
+    for (int row = 0; row < m_resources.size(); ++row) {
+        if (!movingRows.contains(row)) {
+            newOrder.append(m_resources[row]);
+        }
+    }
+
+    adjustedDestination = std::clamp(adjustedDestination, 0, static_cast<int>(newOrder.size()));
+    for (int row : rows) {
+        newOrder.insert(adjustedDestination++, m_resources[row]);
+    }
+
+    return reorderResources(newOrder);
+}
+
+bool ResourceFolderModel::reorderResources(const QList<Resource::Ptr>& newOrder)
+{
+    if (newOrder.size() != m_resources.size()) {
+        return false;
+    }
+
+    bool changed = false;
+    for (int i = 0; i < m_resources.size(); ++i) {
+        if (newOrder[i] != m_resources[i]) {
+            changed = true;
+            break;
+        }
+    }
+
+    if (!changed) {
+        // Keep the persisted order in sync with additions and removals.
+        const auto order = currentOrder();
+        if (order != m_customOrder) {
+            m_customOrder = order;
+            saveCustomOrder();
+        }
+        return true;
+    }
+
+    emit layoutAboutToBeChanged();
+
+    const QModelIndexList oldIndexes = persistentIndexList();
+    QStringList oldIds;
+    oldIds.reserve(oldIndexes.size());
+    for (const auto& oldIndex : oldIndexes) {
+        oldIds.append(oldIndex.isValid() ? m_resources[oldIndex.row()]->internalId() : QString());
+    }
+
+    QHash<QString, int> newRows;
+    newRows.reserve(newOrder.size());
+    for (int row = 0; row < newOrder.size(); ++row) {
+        newRows.insert(newOrder[row]->internalId(), row);
+    }
+
+    m_resources = newOrder;
+
+    QModelIndexList newIndexes;
+    newIndexes.reserve(oldIndexes.size());
+    for (int i = 0; i < oldIndexes.size(); ++i) {
+        const auto& oldIndex = oldIndexes[i];
+        if (!oldIndex.isValid()) {
+            newIndexes.append(QModelIndex());
+            continue;
+        }
+
+        const int row = newRows.value(oldIds[i], -1);
+        newIndexes.append(row >= 0 ? index(row, oldIndex.column()) : QModelIndex());
+    }
+    changePersistentIndexList(oldIndexes, newIndexes);
+
+    m_resourcesIndex.clear();
+    for (int row = 0; row < m_resources.size(); ++row) {
+        m_resourcesIndex.insert(m_resources[row]->internalId(), row);
+    }
+
+    m_customOrder = currentOrder();
+    saveCustomOrder();
+
+    emit layoutChanged();
+    return true;
+}
+
+void ResourceFolderModel::applyCustomOrder()
+{
+    if (m_resources.isEmpty()) {
+        return;
+    }
+
+    QHash<QString, int> ranks;
+    for (int i = 0; i < m_customOrder.size(); ++i) {
+        // The first occurrence wins if the settings contain duplicates.
+        if (!ranks.contains(m_customOrder[i])) {
+            ranks.insert(m_customOrder[i], i);
+        }
+    }
+
+    auto sorted = m_resources;
+    std::stable_sort(sorted.begin(), sorted.end(), [&ranks](const Resource::Ptr& left, const Resource::Ptr& right) {
+        const auto leftRank = ranks.value(left->getOriginalFileName(), std::numeric_limits<int>::max());
+        const auto rightRank = ranks.value(right->getOriginalFileName(), std::numeric_limits<int>::max());
+        return leftRank < rightRank;
+    });
+
+    reorderResources(sorted);
+}
+
+void ResourceFolderModel::saveCustomOrder()
+{
+    if (m_instance == nullptr || m_instance->settings() == nullptr) {
+        return;
+    }
+
+    m_instance->settings()->set(customOrderSetting("CustomOrder"), Json::fromStringList(m_customOrder));
+}
+
+QString ResourceFolderModel::customOrderSetting(const QString& name) const
+{
+    // The directory name keeps mods, core mods and nilmods separate even though they share the same model id.
+    return QStringLiteral("UI/%1_Page/%2/%3").arg(id(), m_dir.dirName(), name);
 }
 
 bool ResourceFolderModel::validateIndex(const QModelIndex& index) const
@@ -825,6 +1117,31 @@ bool ResourceFolderModel::ProxyModel::lessThan(const QModelIndex& sourceLeft, co
     return compareResult < 0;
 }
 
+bool ResourceFolderModel::ProxyModel::dropMimeData(const QMimeData* data,
+                                                   Qt::DropAction action,
+                                                   int row,
+                                                   int column,
+                                                   const QModelIndex& parent)
+{
+    if (sourceModel() == nullptr) {
+        return false;
+    }
+
+    // QAbstractProxyModel forwards the row unchanged, but the row is in proxy coordinates.
+    // Map it to the source row so drops stay correct while a filter hides rows.
+    int sourceRow = row;
+    if (row >= 0) {
+        if (row < rowCount(parent)) {
+            const auto sourceIndex = mapToSource(index(row, 0));
+            sourceRow = sourceIndex.isValid() ? sourceIndex.row() : sourceModel()->rowCount();
+        } else {
+            sourceRow = sourceModel()->rowCount();
+        }
+    }
+
+    return sourceModel()->dropMimeData(data, action, sourceRow, column, mapToSource(parent));
+}
+
 QString ResourceFolderModel::instDirPath() const
 {
     return QFileInfo(m_instance->instanceRoot()).absoluteFilePath();
@@ -959,6 +1276,10 @@ void ResourceFolderModel::applyUpdates(QSet<QString>& currentSet, QSet<QString>&
             idx++;
         }
     }
+
+    if (m_customOrderingEnabled) {
+        applyCustomOrder();
+    }
 }
 Resource::Ptr ResourceFolderModel::find(QString id)
 {
@@ -973,7 +1294,7 @@ QList<Resource*> ResourceFolderModel::allResources()
 {
     QList<Resource*> result;
     result.reserve(m_resources.size());
-    for (const Resource ::Ptr& resource : m_resources) {
+    for (const Resource::Ptr& resource : m_resources) {
         result.append((resource.get()));
     }
     return result;

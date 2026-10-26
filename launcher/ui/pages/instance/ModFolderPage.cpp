@@ -43,12 +43,17 @@
 #include "ui_ExternalResourcesPage.h"
 
 #include <QAbstractItemModel>
+#include <QAbstractItemView>
 #include <QAction>
 #include <QEvent>
+#include <QHeaderView>
+#include <QIcon>
 #include <QKeyEvent>
 #include <QMenu>
 #include <QMessageBox>
+#include <QSet>
 #include <QSortFilterProxyModel>
+#include <QStyle>
 #include <algorithm>
 #include <memory>
 
@@ -110,11 +115,119 @@ ModFolderPage::ModFolderPage(BaseInstance* inst, ModFolderModel* model, QWidget*
     ui->actionsToolbar->insertActionAfter(ui->actionViewHomepage, ui->actionExportMetadata);
 
     ui->actionsToolbar->insertActionAfter(ui->actionViewFolder, ui->actionViewConfigs);
+
+    // ExternalResourcesPage.ui sets the view to DropOnly, and setupUi() runs after the
+    // ModListView constructor, so the drag flag must be re-enabled here.
+    ui->treeView->setDragDropMode(QAbstractItemView::DragDrop);
+    ui->treeView->setDragEnabled(true);
+
+    m_customOrderAction = new QAction(tr("Custom Order"), this);
+    m_customOrderAction->setCheckable(true);
+    m_customOrderAction->setIcon(QIcon::fromTheme("view-sort-ascending", style()->standardIcon(QStyle::SP_FileDialogListView)));
+    m_customOrderAction->setToolTip(tr("Enable custom ordering. Drag and drop mods in the list to reorder them."));
+    ui->actionsToolbar->insertActionAfter(ui->actionDisableItem, m_customOrderAction);
+    connect(m_customOrderAction, &QAction::triggered, this, &ModFolderPage::customOrderToggled);
+
+    m_customOrderAction->setChecked(m_model->customOrderingEnabled());
+    if (m_model->customOrderingEnabled()) {
+        applyCustomOrderSorting(true);
+    }
 }
 
 bool ModFolderPage::shouldDisplay() const
 {
     return true;
+}
+
+QString ModFolderPage::customOrderSortSetting(const QString& name) const
+{
+    return QStringLiteral("UI/%1_Page/%2/%3").arg(m_model->id(), m_model->dir().dirName(), name);
+}
+
+QStringList ModFolderPage::currentVisualOrder() const
+{
+    QStringList order;
+    QSet<QString> seen;
+
+    for (int row = 0; row < m_filterModel->rowCount(); ++row) {
+        auto sourceIndex = m_filterModel->mapToSource(m_filterModel->index(row, 0));
+        if (!sourceIndex.isValid()) {
+            continue;
+        }
+
+        const auto key = m_model->at(sourceIndex.row()).getOriginalFileName();
+        if (!seen.contains(key)) {
+            seen.insert(key);
+            order.append(key);
+        }
+    }
+
+    // Filtered-out resources still need to be part of the custom order.
+    for (int row = 0; row < m_model->rowCount(); ++row) {
+        const auto key = m_model->at(row).getOriginalFileName();
+        if (!seen.contains(key)) {
+            seen.insert(key);
+            order.append(key);
+        }
+    }
+
+    return order;
+}
+
+void ModFolderPage::applyCustomOrderSorting(bool custom)
+{
+    if (custom) {
+        m_filterModel->sort(-1);
+        ui->treeView->setSortingEnabled(false);
+        return;
+    }
+
+    int column = 1;
+    auto order = Qt::AscendingOrder;
+
+    if (m_instance != nullptr && m_instance->settings() != nullptr) {
+        auto* settings = m_instance->settings();
+        column = settings->getOrRegisterSetting(customOrderSortSetting("SortColumn"), column)->get().toInt();
+        order = static_cast<Qt::SortOrder>(
+            settings->getOrRegisterSetting(customOrderSortSetting("SortOrder"), static_cast<int>(order))->get().toInt());
+    }
+
+    if (column < 0 || column >= m_model->columnCount(QModelIndex())) {
+        column = 1;
+    }
+
+    ui->treeView->setSortingEnabled(true);
+    ui->treeView->sortByColumn(column, order);
+}
+
+void ModFolderPage::customOrderToggled(bool enabled)
+{
+    if (enabled == m_model->customOrderingEnabled()) {
+        applyCustomOrderSorting(enabled);
+        return;
+    }
+
+    if (enabled) {
+        if (m_instance != nullptr && m_instance->settings() != nullptr) {
+            auto* settings = m_instance->settings();
+            const int sortColumn = ui->treeView->header()->sortIndicatorSection();
+            const int sortOrder = static_cast<int>(ui->treeView->header()->sortIndicatorOrder());
+            // These settings may not have been registered yet if this is the first toggle.
+            settings->getOrRegisterSetting(customOrderSortSetting("SortColumn"), sortColumn)->set(sortColumn);
+            settings->getOrRegisterSetting(customOrderSortSetting("SortOrder"), sortOrder)->set(sortOrder);
+        }
+
+        const bool hadCustomOrder = m_model->hasCustomOrder();
+        m_model->setCustomOrderingEnabled(true);
+        if (!hadCustomOrder) {
+            // Start from what the user currently sees, rather than the raw directory order.
+            m_model->setCustomOrder(currentVisualOrder());
+        }
+    } else {
+        m_model->setCustomOrderingEnabled(false);
+    }
+
+    applyCustomOrderSorting(enabled);
 }
 
 void ModFolderPage::updateFrame(const QModelIndex& current, [[maybe_unused]] const QModelIndex& previous)

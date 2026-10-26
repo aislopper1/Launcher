@@ -42,6 +42,8 @@
 #include "ExternalResourcesPage.h"
 #include "ui/dialogs/ResourceDownloadDialog.h"
 
+class QAction;
+
 class ModFolderPage : public ExternalResourcesPage {
     Q_OBJECT
 
@@ -73,9 +75,16 @@ class ModFolderPage : public ExternalResourcesPage {
     void exportModMetadata();
     void changeModVersion();
 
+    void customOrderToggled(bool enabled);
+
    protected:
+    QStringList currentVisualOrder() const;
+    void applyCustomOrderSorting(bool custom);
+    QString customOrderSortSetting(const QString& name) const;
+
     ModFolderModel* m_model;
     QPointer<ResourceDownload::ModDownloadDialog> m_downloadDialog;
+    QAction* m_customOrderAction = nullptr;
 };
 
 class CoreModFolderPage : public ModFolderPage {

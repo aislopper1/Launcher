@@ -77,6 +77,8 @@ ModFolderModel::ModFolderModel(const QDir& dir, BaseInstance* instance, bool isI
     m_columnsHideable = { false, true, false, true, true, true, true, true, true, true, true, true, true, true };
 
     connect(this, &ModFolderModel::parseFinished, this, &ModFolderModel::onParseFinished);
+
+    initializeCustomOrdering();
 }
 
 QVariant ModFolderModel::data(const QModelIndex& index, int role) const

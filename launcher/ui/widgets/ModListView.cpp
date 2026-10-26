@@ -16,6 +16,7 @@
 #include "ModListView.h"
 #include <QDrag>
 #include <QHeaderView>
+#include <QMimeData>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QRect>
@@ -32,10 +33,35 @@ ModListView::ModListView(QWidget* parent) : QTreeView(parent)
     setSelectionBehavior(QAbstractItemView::SelectRows);
     setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     setDropIndicatorShown(true);
-    setDragEnabled(true);
-    setDragDropMode(QAbstractItemView::DropOnly);
+    setDragDropMode(QAbstractItemView::DragDrop);
     viewport()->setAcceptDrops(true);
     setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+}
+
+void ModListView::startDrag([[maybe_unused]] Qt::DropActions supportedActions)
+{
+    QModelIndexList indexes;
+    for (const auto& index : selectedIndexes()) {
+        if (index.column() == 0 && index.flags().testFlag(Qt::ItemIsDragEnabled)) {
+            indexes.append(index);
+        }
+    }
+
+    if (indexes.isEmpty()) {
+        return;
+    }
+
+    QMimeData* mimeData = model()->mimeData(indexes);
+    if (mimeData == nullptr) {
+        return;
+    }
+
+    auto* drag = new QDrag(this);
+    drag->setMimeData(mimeData);
+
+    // We do the actual move in the model's dropMimeData(). Avoid the base implementation,
+    // which removes the dragged rows after a successful move.
+    drag->exec(Qt::MoveAction, Qt::MoveAction);
 }
 
 void ModListView::setModel(QAbstractItemModel* model)

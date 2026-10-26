@@ -33,6 +33,7 @@
  *      limitations under the License.
  */
 
+#include <QMimeData>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
@@ -242,6 +243,65 @@ class ResourceFolderModelTest : public QObject {
         QVERIFY(!res_2.enable(initial_enabled_res_2 ? EnableAction::ENABLE : EnableAction::DISABLE));
         QVERIFY(res_2.enabled() == initial_enabled_res_2);
         QVERIFY(res_2.internalId() == id_2);
+    }
+
+    void test_custom_order()
+    {
+        QString source = QFINDTESTDATA("testdata/Resources");
+        ModFolderModel model(source, nullptr, false, false);
+
+        QCOMPARE(model.size(), 0);
+
+        { EXEC_UPDATE_TASK(model.startWatching(), ) }
+
+        QCOMPARE(model.size(), 4);
+        QVERIFY(!model.customOrderingEnabled());
+
+        // Internal drag and drop is only available when custom ordering is enabled.
+        QVERIFY(!model.flags(model.index(0, 0)).testFlag(Qt::ItemIsDragEnabled));
+        QVERIFY(model.mimeData({ model.index(0, 0) }) == nullptr);
+
+        model.setCustomOrderingEnabled(true);
+        QVERIFY(model.customOrderingEnabled());
+        QVERIFY(model.flags(model.index(0, 0)).testFlag(Qt::ItemIsDragEnabled));
+
+        QStringList initialOrder = model.currentOrder();
+        QCOMPARE(initialOrder.size(), 4);
+
+        // Folder updates append resources in QSet order, so make the starting order deterministic.
+        initialOrder.sort();
+        model.setCustomOrder(initialOrder);
+        QCOMPARE(model.currentOrder(), initialOrder);
+
+        auto* mimeData = model.mimeData({ model.index(0, 0) });
+        QVERIFY(mimeData != nullptr);
+        QVERIFY(model.dropMimeData(mimeData, Qt::MoveAction, 3, 0, {}));
+        delete mimeData;
+
+        QStringList expectedOrder = initialOrder;
+        const auto moved = expectedOrder.takeFirst();
+        expectedOrder.insert(2, moved);
+        QCOMPARE(model.currentOrder(), expectedOrder);
+
+        // Drops through the filter proxy must map the proxy row to the source row.
+        // Filtering out "supercoolmod.jar" leaves three visible rows above it.
+        ResourceFolderModel::ProxyModel proxy;
+        proxy.setSourceModel(&model);
+        proxy.setFilterFixedString("test");
+        QCOMPARE(proxy.rowCount(), 3);
+
+        auto* proxyModel = static_cast<QAbstractItemModel*>(&proxy);
+        auto* proxyMimeData = proxyModel->mimeData({ proxy.index(0, 0) });
+        QVERIFY(proxyMimeData != nullptr);
+        QVERIFY(proxyModel->dropMimeData(proxyMimeData, Qt::MoveAction, proxy.rowCount(), 0, {}));
+        delete proxyMimeData;
+
+        QStringList filteredExpectedOrder = expectedOrder;
+        const auto filteredMoved = filteredExpectedOrder.takeAt(1);
+        filteredExpectedOrder.append(filteredMoved);
+        QCOMPARE(model.currentOrder(), filteredExpectedOrder);
+
+        model.stopWatching();
     }
 };
 

@@ -149,7 +149,23 @@ class ResourceFolderModel : public QAbstractListModel {
     /// flags, mostly to support drag&drop
     Qt::ItemFlags flags(const QModelIndex& index) const override;
     QStringList mimeTypes() const override;
+    QMimeData* mimeData(const QModelIndexList& indexes) const override;
+    [[nodiscard]] bool canDropMimeData(const QMimeData* data,
+                                       Qt::DropAction action,
+                                       int row,
+                                       int column,
+                                       const QModelIndex& parent) const override;
     [[nodiscard]] bool dropMimeData(const QMimeData* data, Qt::DropAction action, int row, int column, const QModelIndex& parent) override;
+
+    /** MIME type used to move resources around inside a resource list. */
+    static constexpr const char* InternalMimeType = "application/x-prismlauncher-resource-rows";
+
+    bool customOrderingEnabled() const { return m_customOrderingEnabled; }
+    bool hasCustomOrder() const { return !m_customOrder.isEmpty(); }
+    QStringList customOrder() const { return m_customOrder; }
+    QStringList currentOrder() const;
+    void setCustomOrderingEnabled(bool enabled);
+    void setCustomOrder(const QStringList& order);
 
     [[nodiscard]] bool validateIndex(const QModelIndex& index) const;
 
@@ -180,6 +196,7 @@ class ResourceFolderModel : public QAbstractListModel {
        protected:
         bool filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const override;
         bool lessThan(const QModelIndex& sourceLeft, const QModelIndex& sourceRight) const override;
+        bool dropMimeData(const QMimeData* data, Qt::DropAction action, int row, int column, const QModelIndex& parent) override;
     };
 
     QString instDirPath() const;
@@ -188,6 +205,7 @@ class ResourceFolderModel : public QAbstractListModel {
    signals:
     void updateFinished();
     void parseFinished();
+    void customOrderingChanged(bool enabled);
 
    protected:
     [[nodiscard]] virtual Task* createPreUpdateTask() { return nullptr; }
@@ -216,6 +234,21 @@ class ResourceFolderModel : public QAbstractListModel {
      *
      */
     void applyUpdates(QSet<QString>& currentSet, QSet<QString>& newSet, QMap<QString, Resource::Ptr>& newResources);
+
+    /** Loads the custom ordering state from the instance settings. Does nothing if it was already loaded. */
+    void initializeCustomOrdering();
+
+    /** Applies the stored custom order to the raw resource list, appending any new resources at the end. */
+    void applyCustomOrder();
+
+    /** Moves resources identified by their internal IDs to the given destination row. */
+    bool moveResourcesById(const QStringList& ids, int destinationRow);
+
+    /** Replaces the raw resource list, keeping persistent indexes and the stored custom order in sync. */
+    bool reorderResources(const QList<Resource::Ptr>& newOrder);
+
+    void saveCustomOrder();
+    QString customOrderSetting(const QString& name) const;
 
    protected slots:
     void directoryChanged(const QString&);
@@ -260,6 +293,11 @@ class ResourceFolderModel : public QAbstractListModel {
     bool m_scheduledUpdate = false;
 
     QList<Resource::Ptr> m_resources;
+
+    // Ordering is stored by original file name, so enabling/disabling a resource doesn't change its position.
+    QStringList m_customOrder;
+    bool m_customOrderingEnabled = false;
+    bool m_customOrderingInitialized = false;
 
     // Represents the relationship between a resource's internal ID and it's row position on the model.
     QMap<QString, int> m_resourcesIndex;
